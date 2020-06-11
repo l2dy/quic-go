@@ -59,14 +59,6 @@ var _ = Describe("Received Packet Tracker", func() {
 				Expect(tracker.ackQueued).To(BeFalse())
 			}
 
-			receiveAndAckPacketsUntilAckDecimation := func() {
-				for i := 1; i <= minReceivedBeforeAckDecimation; i++ {
-					tracker.ReceivedPacket(protocol.PacketNumber(i), time.Time{}, true)
-				}
-				Expect(tracker.GetAckFrame(true)).ToNot(BeNil())
-				Expect(tracker.ackQueued).To(BeFalse())
-			}
-
 			It("always queues an ACK for the first packet", func() {
 				tracker.ReceivedPacket(1, time.Now(), true)
 				Expect(tracker.ackQueued).To(BeTrue())
@@ -81,7 +73,7 @@ var _ = Describe("Received Packet Tracker", func() {
 				Expect(tracker.GetAckFrame(true).DelayTime).To(BeNumerically("~", 0, time.Second))
 			})
 
-			It("queues an ACK for every second ack-eliciting packet at the beginning", func() {
+			It("queues an ACK for every second ack-eliciting packet", func() {
 				receiveAndAck10Packets()
 				p := protocol.PacketNumber(11)
 				for i := 0; i <= 20; i++ {
@@ -107,20 +99,6 @@ var _ = Describe("Received Packet Tracker", func() {
 				Expect(tracker.GetAckFrame(false)).ToNot(BeNil())
 			})
 
-			It("queues an ACK for every 10 ack-eliciting packet, if they are arriving fast", func() {
-				receiveAndAck10Packets()
-				p := protocol.PacketNumber(10000)
-				for i := 0; i < 9; i++ {
-					tracker.ReceivedPacket(p, time.Now(), true)
-					Expect(tracker.ackQueued).To(BeFalse())
-					p++
-				}
-				Expect(tracker.GetAlarmTimeout()).NotTo(BeZero())
-				tracker.ReceivedPacket(p, time.Now(), true)
-				Expect(tracker.ackQueued).To(BeTrue())
-				Expect(tracker.GetAlarmTimeout()).To(BeZero())
-			})
-
 			It("only sets the timer when receiving a ack-eliciting packets", func() {
 				receiveAndAck10Packets()
 				tracker.ReceivedPacket(11, time.Now(), false)
@@ -134,80 +112,64 @@ var _ = Describe("Received Packet Tracker", func() {
 
 			It("queues an ACK if it was reported missing before", func() {
 				receiveAndAck10Packets()
-				tracker.ReceivedPacket(11, time.Time{}, true)
-				tracker.ReceivedPacket(13, time.Time{}, true)
+				tracker.ReceivedPacket(11, time.Now(), true)
+				tracker.ReceivedPacket(13, time.Now(), true)
 				ack := tracker.GetAckFrame(true) // ACK: 1-11 and 13, missing: 12
 				Expect(ack).ToNot(BeNil())
 				Expect(ack.HasMissingRanges()).To(BeTrue())
 				Expect(tracker.ackQueued).To(BeFalse())
-				tracker.ReceivedPacket(12, time.Time{}, false)
+				tracker.ReceivedPacket(12, time.Now(), false)
 				Expect(tracker.ackQueued).To(BeTrue())
 			})
 
 			It("doesn't queue an ACK if it was reported missing before, but is below the threshold", func() {
 				receiveAndAck10Packets()
 				// 11 is missing
-				tracker.ReceivedPacket(12, time.Time{}, true)
-				tracker.ReceivedPacket(13, time.Time{}, true)
+				tracker.ReceivedPacket(12, time.Now(), true)
+				tracker.ReceivedPacket(13, time.Now(), true)
 				ack := tracker.GetAckFrame(true) // ACK: 1-10, 12-13
 				Expect(ack).ToNot(BeNil())
 				// now receive 11
 				tracker.IgnoreBelow(12)
-				tracker.ReceivedPacket(11, time.Time{}, false)
+				tracker.ReceivedPacket(11, time.Now(), false)
 				ack = tracker.GetAckFrame(true)
 				Expect(ack).To(BeNil())
 			})
 
-			It("doesn't queue an ACK if the packet closes a gap that was not yet reported", func() {
-				receiveAndAckPacketsUntilAckDecimation()
-				p := protocol.PacketNumber(minReceivedBeforeAckDecimation + 1)
-				tracker.ReceivedPacket(p+1, time.Now(), true) // p is missing now
-				Expect(tracker.ackQueued).To(BeFalse())
-				Expect(tracker.GetAlarmTimeout()).ToNot(BeZero())
-				tracker.ReceivedPacket(p, time.Now(), true) // p is not missing any more
-				Expect(tracker.ackQueued).To(BeFalse())
+			It("doesn't queue an ACK if for non-ack-eliciting packets arriving out-of-order", func() {
+				receiveAndAck10Packets()
+				tracker.ReceivedPacket(11, time.Now(), true)
+				Expect(tracker.GetAckFrame(true)).To(BeNil())
+				tracker.ReceivedPacket(13, time.Now(), false) // receive a non-ack-eliciting packet out-of-order
+				Expect(tracker.GetAckFrame(true)).To(BeNil())
 			})
 
-			It("sets an ACK alarm after 1/4 RTT if it creates a new missing range", func() {
-				now := time.Now().Add(-time.Hour)
-				rtt := 80 * time.Millisecond
-				rttStats.UpdateRTT(rtt, 0, now)
-				receiveAndAckPacketsUntilAckDecimation()
-				p := protocol.PacketNumber(minReceivedBeforeAckDecimation + 1)
-				for i := p; i < p+6; i++ {
-					tracker.ReceivedPacket(i, now, true)
-				}
-				tracker.ReceivedPacket(p+10, now, true) // we now know that packets p+7, p+8 and p+9
-				Expect(rttStats.MinRTT()).To(Equal(rtt))
-				Expect(tracker.ackAlarm.Sub(now)).To(Equal(rtt / 8))
-				ack := tracker.GetAckFrame(true)
-				Expect(ack.HasMissingRanges()).To(BeTrue())
-				Expect(ack).ToNot(BeNil())
+			It("doesn't queue an ACK if packets arrive out-of-order, but haven't been acknowledged yet", func() {
+				receiveAndAck10Packets()
+				Expect(tracker.lastAck).ToNot(BeNil())
+				tracker.ReceivedPacket(12, time.Now(), false)
+				Expect(tracker.GetAckFrame(true)).To(BeNil())
+				// 11 is received out-of-order, but this hasn't been reported in an ACK frame yet
+				tracker.ReceivedPacket(11, time.Now(), true)
+				Expect(tracker.GetAckFrame(true)).To(BeNil())
 			})
 		})
 
 		Context("ACK generation", func() {
 			It("generates an ACK for an ack-eliciting packet, if no ACK is queued yet", func() {
-				tracker.ReceivedPacket(1, time.Time{}, true)
+				tracker.ReceivedPacket(1, time.Now(), true)
 				// The first packet is always acknowledged.
 				Expect(tracker.GetAckFrame(true)).ToNot(BeNil())
-
-				tracker.ReceivedPacket(2, time.Time{}, true)
-				Expect(tracker.GetAckFrame(true)).To(BeNil())
-				ack := tracker.GetAckFrame(false)
-				Expect(ack).ToNot(BeNil())
-				Expect(ack.LowestAcked()).To(Equal(protocol.PacketNumber(1)))
-				Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(2)))
 			})
 
 			It("doesn't generate ACK for a non-ack-eliciting packet, if no ACK is queued yet", func() {
-				tracker.ReceivedPacket(1, time.Time{}, true)
+				tracker.ReceivedPacket(1, time.Now(), true)
 				// The first packet is always acknowledged.
 				Expect(tracker.GetAckFrame(true)).ToNot(BeNil())
 
-				tracker.ReceivedPacket(2, time.Time{}, false)
+				tracker.ReceivedPacket(2, time.Now(), false)
 				Expect(tracker.GetAckFrame(false)).To(BeNil())
-				tracker.ReceivedPacket(3, time.Time{}, true)
+				tracker.ReceivedPacket(3, time.Now(), true)
 				ack := tracker.GetAckFrame(false)
 				Expect(ack).ToNot(BeNil())
 				Expect(ack.LowestAcked()).To(Equal(protocol.PacketNumber(1)))
@@ -220,8 +182,8 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("generates a simple ACK frame", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
-					tracker.ReceivedPacket(2, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
+					tracker.ReceivedPacket(2, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(2)))
@@ -230,7 +192,7 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("generates an ACK for packet number 0", func() {
-					tracker.ReceivedPacket(0, time.Time{}, true)
+					tracker.ReceivedPacket(0, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(0)))
@@ -239,7 +201,7 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("sets the delay time", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
 					tracker.ReceivedPacket(2, time.Now().Add(-1337*time.Millisecond), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
@@ -254,11 +216,11 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("saves the last sent ACK", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(tracker.lastAck).To(Equal(ack))
-					tracker.ReceivedPacket(2, time.Time{}, true)
+					tracker.ReceivedPacket(2, time.Now(), true)
 					tracker.ackQueued = true
 					ack = tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
@@ -266,8 +228,8 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("generates an ACK frame with missing packets", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
-					tracker.ReceivedPacket(4, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
+					tracker.ReceivedPacket(4, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(4)))
@@ -279,9 +241,9 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("generates an ACK for packet number 0 and other packets", func() {
-					tracker.ReceivedPacket(0, time.Time{}, true)
-					tracker.ReceivedPacket(1, time.Time{}, true)
-					tracker.ReceivedPacket(3, time.Time{}, true)
+					tracker.ReceivedPacket(0, time.Now(), true)
+					tracker.ReceivedPacket(1, time.Now(), true)
+					tracker.ReceivedPacket(3, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(3)))
@@ -294,8 +256,8 @@ var _ = Describe("Received Packet Tracker", func() {
 
 				It("doesn't add delayed packets to the packetHistory", func() {
 					tracker.IgnoreBelow(7)
-					tracker.ReceivedPacket(4, time.Time{}, true)
-					tracker.ReceivedPacket(10, time.Time{}, true)
+					tracker.ReceivedPacket(4, time.Now(), true)
+					tracker.ReceivedPacket(10, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(10)))
@@ -304,7 +266,7 @@ var _ = Describe("Received Packet Tracker", func() {
 
 				It("deletes packets from the packetHistory when a lower limit is set", func() {
 					for i := 1; i <= 12; i++ {
-						tracker.ReceivedPacket(protocol.PacketNumber(i), time.Time{}, true)
+						tracker.ReceivedPacket(protocol.PacketNumber(i), time.Now(), true)
 					}
 					tracker.IgnoreBelow(7)
 					// check that the packets were deleted from the receivedPacketHistory by checking the values in an ACK frame
@@ -318,14 +280,14 @@ var _ = Describe("Received Packet Tracker", func() {
 				// TODO: remove this test when dropping support for STOP_WAITINGs
 				It("handles a lower limit of 0", func() {
 					tracker.IgnoreBelow(0)
-					tracker.ReceivedPacket(1337, time.Time{}, true)
+					tracker.ReceivedPacket(1337, time.Now(), true)
 					ack := tracker.GetAckFrame(true)
 					Expect(ack).ToNot(BeNil())
 					Expect(ack.LargestAcked()).To(Equal(protocol.PacketNumber(1337)))
 				})
 
 				It("resets all counters needed for the ACK queueing decision when sending an ACK", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
 					tracker.ackAlarm = time.Now().Add(-time.Minute)
 					Expect(tracker.GetAckFrame(true)).ToNot(BeNil())
 					Expect(tracker.packetsReceivedSinceLastAck).To(BeZero())
@@ -335,21 +297,21 @@ var _ = Describe("Received Packet Tracker", func() {
 				})
 
 				It("doesn't generate an ACK when none is queued and the timer is not set", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
 					tracker.ackQueued = false
 					tracker.ackAlarm = time.Time{}
 					Expect(tracker.GetAckFrame(true)).To(BeNil())
 				})
 
 				It("doesn't generate an ACK when none is queued and the timer has not yet expired", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
 					tracker.ackQueued = false
 					tracker.ackAlarm = time.Now().Add(time.Minute)
 					Expect(tracker.GetAckFrame(true)).To(BeNil())
 				})
 
 				It("generates an ACK when the timer has expired", func() {
-					tracker.ReceivedPacket(1, time.Time{}, true)
+					tracker.ReceivedPacket(1, time.Now(), true)
 					tracker.ackQueued = false
 					tracker.ackAlarm = time.Now().Add(-time.Minute)
 					Expect(tracker.GetAckFrame(true)).ToNot(BeNil())
